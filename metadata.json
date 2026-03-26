@@ -1,5 +1,5 @@
 {
-  "name": "ClovaNote AI",
-  "description": "Efficient AI-powered audio transcription with chunking, speaker diarization, and real-time visualization.",
+  "name": "Audio Transcriber",
+  "description": "A tool to transcribe scientific audio recordings (m4a) and merge PDF documents.",
   "requestFramePermissions": []
 }
