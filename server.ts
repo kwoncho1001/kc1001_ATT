@@ -7,6 +7,7 @@ import ffmpegInstaller from '@ffmpeg-installer/ffmpeg';
 import { GoogleGenAI } from '@google/genai';
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
 import { fileURLToPath } from 'url';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -15,8 +16,8 @@ const __dirname = path.dirname(__filename);
 // Configure FFmpeg path
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 
-// Configure Multer for file uploads
-const uploadDir = path.join(__dirname, 'uploads');
+// Configure Multer for file uploads (use /tmp for Cloud Run compatibility)
+const uploadDir = path.join(os.tmpdir(), 'uploads');
 if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true });
 }
@@ -26,12 +27,18 @@ const storage = multer.diskStorage({
     cb(null, uploadDir);
   },
   filename: (req, file, cb) => {
+    // Use a safe filename to avoid encoding issues with Korean/spaces
     const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-    cb(null, file.fieldname + '-' + uniqueSuffix + path.extname(file.originalname));
+    cb(null, 'audio-' + uniqueSuffix + path.extname(file.originalname));
   }
 });
 
-const upload = multer({ storage: storage });
+const upload = multer({ 
+  storage: storage,
+  limits: {
+    fileSize: 1024 * 1024 * 1024, // 1GB limit
+  }
+});
 
 async function startServer() {
   const app = express();
