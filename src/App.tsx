@@ -3,8 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { GoogleGenAI } from "@google/genai";
+import { FFmpeg } from '@ffmpeg/ffmpeg';
+import { fetchFile, toBlobURL } from '@ffmpeg/util';
 import { 
   Upload, 
   FileAudio, 
@@ -29,7 +31,8 @@ import {
   Stethoscope,
   MessageSquare,
   TrendingUp,
-  Landmark
+  Landmark,
+  Settings
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { PDFDocument } from 'pdf-lib';
@@ -37,7 +40,7 @@ import { PDFDocument } from 'pdf-lib';
 // Initialize Gemini
 const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
 
-type Tab = 'audio' | 'pdf';
+type Tab = 'audio' | 'compress' | 'pdf';
 
 const FIELDS = [
   { id: 'science', name: '과학/기술', icon: Beaker, desc: '전문 과학 용어 정밀 분석' },
@@ -59,7 +62,7 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<Tab>('audio');
   
   // Audio State
-  const [file, setFile] = useState<File | null>(null);
+  const [files, setFiles] = useState<File[]>([]);
   const [transcription, setTranscription] = useState<string>('');
   const [isTranscribing, setIsTranscribing] = useState(false);
   const [audioError, setAudioError] = useState<string | null>(null);
@@ -68,23 +71,186 @@ export default function App() {
   const [targetLanguage, setTargetLanguage] = useState('ko');
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // FFmpeg State
+  const ffmpegRef = useRef(new FFmpeg());
+  const [isFfmpegLoaded, setIsFfmpegLoaded] = useState(false);
+  const [isCompressing, setIsCompressing] = useState(false);
+  const [compressionProgress, setCompressionProgress] = useState(0);
+  const [processingIndex, setProcessingIndex] = useState<number>(-1);
+
+  useEffect(() => {
+    loadFfmpeg();
+  }, []);
+
+  const loadFfmpeg = async (): Promise<boolean> => {
+    const ffmpeg = ffmpegRef.current;
+    if (ffmpeg.loaded) {
+      setIsFfmpegLoaded(true);
+      return true;
+    }
+    
+    const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd';
+    ffmpeg.on('progress', ({ progress }) => {
+      setCompressionProgress(Math.round(progress * 100));
+    });
+    
+    try {
+      await ffmpeg.load({
+        coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
+        wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+      });
+      setIsFfmpegLoaded(true);
+      return true;
+    } catch (error) {
+      console.error('Error loading FFmpeg:', error);
+      setAudioError('오디오 처리 도구를 불러오는데 실패했습니다. 페이지를 새로고침 해주세요.');
+      return false;
+    }
+  };
+
   // PDF State
   const [pdfFiles, setPdfFiles] = useState<File[]>([]);
   const [isMerging, setIsMerging] = useState(false);
   const [pdfError, setPdfError] = useState<string | null>(null);
+  const [isDraggingPdf, setIsDraggingPdf] = useState(false);
   const pdfInputRef = useRef<HTMLInputElement>(null);
 
-  // Audio Handlers
-  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selectedFile = e.target.files?.[0];
-    if (selectedFile) {
-      if (selectedFile.type === 'audio/x-m4a' || selectedFile.name.endsWith('.m4a')) {
-        setFile(selectedFile);
-        setAudioError(null);
-        setTranscription('');
-      } else {
-        setAudioError('m4a 형식의 파일만 지원합니다.');
+  // Compress Tab State
+  const [compressFiles, setCompressFiles] = useState<File[]>([]);
+  const [compressedResults, setCompressedResults] = useState<{original: File, compressed: File}[]>([]);
+  const [isCompressingTab, setIsCompressingTab] = useState(false);
+  const [compressProcessingIndex, setCompressProcessingIndex] = useState<number>(-1);
+  const [compressError, setCompressError] = useState<string | null>(null);
+  const [isDraggingCompress, setIsDraggingCompress] = useState(false);
+  const compressInputRef = useRef<HTMLInputElement>(null);
+
+  const processCompressFiles = (selectedFiles: File[]) => {
+    const validFiles = selectedFiles.filter(f => f.type.startsWith('audio/') || f.name.match(/\.(mp3|wav|m4a|ogg|flac|aac)$/i));
+    if (validFiles.length > 0) {
+      setCompressFiles(prev => [...prev, ...validFiles]);
+    }
+  };
+
+  const handleCompressFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    processCompressFiles(Array.from(e.target.files || []));
+    if (compressInputRef.current) compressInputRef.current.value = '';
+  };
+
+  const handleCompressDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setIsDraggingCompress(false);
+    if (isCompressingTab) return;
+    processCompressFiles(Array.from(e.dataTransfer.files));
+  };
+
+  const removeCompressFile = (index: number) => {
+    setCompressFiles(prev => prev.filter((_, i) => i !== index));
+    setCompressedResults(prev => prev.filter((_, i) => i !== index));
+  };
+
+  const startCompressionOnly = async () => {
+    if (compressFiles.length === 0) return;
+    setIsCompressingTab(true);
+    setCompressedResults([]);
+    setCompressError(null);
+
+    const loaded = await loadFfmpeg();
+    if (!loaded) {
+      setCompressError('오디오 압축 도구를 불러오는데 실패했습니다. 네트워크 상태를 확인하거나 페이지를 새로고침 해주세요.');
+      setIsCompressingTab(false);
+      return;
+    }
+
+    for (let i = 0; i < compressFiles.length; i++) {
+      setCompressProcessingIndex(i);
+      const currentFile = compressFiles[i];
+      try {
+        const compressed = await compressAudio(currentFile);
+        setCompressedResults(prev => [...prev, { original: currentFile, compressed }]);
+      } catch (err) {
+        console.error(`Compression error for ${currentFile.name}:`, err);
+        setCompressError(prev => (prev ? prev + '\n' : '') + `${currentFile.name} 압축 중 오류가 발생했습니다.`);
       }
+    }
+    setCompressProcessingIndex(-1);
+    setIsCompressingTab(false);
+  };
+
+  const downloadCompressedFile = (file: File) => {
+    const url = URL.createObjectURL(file);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = file.name;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  };
+
+  const resetCompress = () => {
+    setCompressFiles([]);
+    setCompressedResults([]);
+    setCompressProcessingIndex(-1);
+    setCompressError(null);
+  };
+
+  // Audio Handlers
+  const [isDraggingAudio, setIsDraggingAudio] = useState(false);
+
+  const processAudioFiles = (selectedFiles: File[]) => {
+    const validFiles = selectedFiles.filter(f => f.type.startsWith('audio/') || f.name.match(/\.(mp3|wav|m4a|ogg|flac|aac)$/i));
+    if (validFiles.length > 0) {
+      setFiles(prev => [...prev, ...validFiles]);
+      setAudioError(null);
+    } else if (selectedFiles.length > 0) {
+      setAudioError('오디오 파일만 지원합니다.');
+    }
+  };
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    processAudioFiles(Array.from(e.target.files || []));
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  const handleAudioDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setIsDraggingAudio(false);
+    if (isTranscribing) return;
+    processAudioFiles(Array.from(e.dataTransfer.files));
+  };
+
+  const removeFile = (index: number) => {
+    setFiles(prev => prev.filter((_, i) => i !== index));
+  };
+
+  const compressAudio = async (inputFile: File): Promise<File> => {
+    setIsCompressing(true);
+    setCompressionProgress(0);
+    try {
+      const ffmpeg = ffmpegRef.current;
+      const safeName = inputFile.name.replace(/[^a-zA-Z0-9.]/g, '_');
+      const inputName = `input_${Date.now()}_${safeName}`;
+      const outputName = `output_${Date.now()}.m4a`;
+      
+      await ffmpeg.writeFile(inputName, await fetchFile(inputFile));
+      
+      // Convert to m4a with lower bitrate (e.g., 64k) to compress
+      await ffmpeg.exec(['-i', inputName, '-b:a', '64k', outputName]);
+      
+      const fileData = await ffmpeg.readFile(outputName);
+      const data = new Uint8Array(fileData as ArrayBuffer);
+      const blob = new Blob([data.buffer], { type: 'audio/x-m4a' });
+      const newFile = new File([blob], inputFile.name.replace(/\.[^/.]+$/, "") + '_compressed.m4a', { type: 'audio/x-m4a' });
+      
+      await ffmpeg.deleteFile(inputName);
+      await ffmpeg.deleteFile(outputName);
+
+      return newFile;
+    } catch (error) {
+      console.error('Compression error:', error);
+      throw new Error('오디오 압축 중 오류가 발생했습니다.');
+    } finally {
+      setIsCompressing(false);
     }
   };
 
@@ -101,44 +267,65 @@ export default function App() {
   };
 
   const transcribeAudio = async () => {
-    if (!file) return;
+    if (files.length === 0) return;
     setIsTranscribing(true);
     setAudioError(null);
+    setTranscription('');
 
     const fieldInfo = FIELDS.find(f => f.id === selectedField);
     const langInfo = LANGUAGES.find(l => l.id === targetLanguage);
 
-    try {
-      const base64Data = await fileToBase64(file);
-      const model = "gemini-3-flash-preview";
-      const response = await genAI.models.generateContent({
-        model: model,
-        contents: [
-          {
-            role: "user",
-            parts: [
-              { inlineData: { mimeType: "audio/m4a", data: base64Data } },
-              { 
-                text: `이 오디오 파일의 내용을 ${langInfo?.name}로 정확하게 받아쓰기(transcribe) 해주세요. 
-                특히 ${fieldInfo?.name} 분야의 용어와 개념에 주의하여 정확하게 텍스트로 변환해주세요. 
-                화자가 여러 명이라면 구분하여 작성해주고, 가독성 있게 문단을 나누어주세요.` 
-              }
-            ]
-          }
-        ],
-        config: {
-          systemInstruction: `당신은 전문 ${fieldInfo?.name} 분야의 속기사입니다. 제공된 오디오에서 해당 분야의 전문 용어를 정확하게 파악하고 ${langInfo?.name}로 완벽하게 전사합니다.`
+    let fullTranscription = '';
+
+    for (let i = 0; i < files.length; i++) {
+      setProcessingIndex(i);
+      const currentFile = files[i];
+      
+      try {
+        let targetFile = currentFile;
+        if (isFfmpegLoaded) {
+          targetFile = await compressAudio(currentFile);
         }
-      });
-      const text = response.text;
-      if (text) setTranscription(text);
-      else throw new Error('텍스트를 추출하지 못했습니다.');
-    } catch (err: any) {
-      console.error('Transcription error:', err);
-      setAudioError('변환 중 오류가 발생했습니다: ' + (err.message || '알 수 없는 오류'));
-    } finally {
-      setIsTranscribing(false);
+
+        const base64Data = await fileToBase64(targetFile);
+        const model = "gemini-3-flash-preview";
+        const response = await genAI.models.generateContent({
+          model: model,
+          contents: [
+            {
+              role: "user",
+              parts: [
+                { inlineData: { mimeType: "audio/m4a", data: base64Data } },
+                { 
+                  text: `이 오디오 파일의 내용을 ${langInfo?.name}로 정확하게 받아쓰기(transcribe) 해주세요. 
+                  특히 ${fieldInfo?.name} 분야의 용어와 개념에 주의하여 정확하게 텍스트로 변환해주세요. 
+                  화자가 여러 명이라면 구분하여 작성해주고, 가독성 있게 문단을 나누어주세요.` 
+                }
+              ]
+            }
+          ],
+          config: {
+            systemInstruction: `당신은 전문 ${fieldInfo?.name} 분야의 속기사입니다. 제공된 오디오에서 해당 분야의 전문 용어를 정확하게 파악하고 ${langInfo?.name}로 완벽하게 전사합니다.`
+          }
+        });
+        
+        const text = response.text;
+        if (text) {
+          const fileResult = `--- ${currentFile.name} ---\n${text}\n\n`;
+          fullTranscription += fileResult;
+          setTranscription(fullTranscription);
+          downloadTxt(text, currentFile.name);
+        } else {
+          throw new Error('텍스트를 추출하지 못했습니다.');
+        }
+      } catch (err: any) {
+        console.error(`Transcription error for ${currentFile.name}:`, err);
+        setAudioError(prev => (prev ? prev + '\n' : '') + `${currentFile.name} 변환 중 오류: ${err.message || '알 수 없는 오류'}`);
+      }
     }
+
+    setProcessingIndex(-1);
+    setIsTranscribing(false);
   };
 
   const copyToClipboard = () => {
@@ -147,13 +334,14 @@ export default function App() {
     setTimeout(() => setCopySuccess(false), 2000);
   };
 
-  const downloadTxt = () => {
-    if (!transcription) return;
-    const blob = new Blob([transcription], { type: 'text/plain;charset=utf-8' });
+  const downloadTxt = (textToDownload?: string | React.MouseEvent, originalFilename?: string) => {
+    const content = typeof textToDownload === 'string' ? textToDownload : transcription;
+    if (!content) return;
+    const blob = new Blob([content], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
-    link.download = file ? `${file.name.replace(/\.[^/.]+$/, "")}_transcription.txt` : 'transcription.txt';
+    link.download = originalFilename ? `${originalFilename.replace(/\.[^/.]+$/, "")}_transcription.txt` : 'all_transcriptions.txt';
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
@@ -161,15 +349,15 @@ export default function App() {
   };
 
   const resetAudio = () => {
-    setFile(null);
+    setFiles([]);
     setTranscription('');
     setAudioError(null);
+    setProcessingIndex(-1);
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
   // PDF Handlers
-  const handlePdfChange = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const selectedFiles = Array.from(e.target.files || []) as File[];
+  const processPdfFiles = (selectedFiles: File[]) => {
     const validPdfs = selectedFiles.filter(f => f.type === 'application/pdf');
     if (validPdfs.length !== selectedFiles.length) {
       setPdfError('PDF 파일만 선택 가능합니다.');
@@ -177,7 +365,18 @@ export default function App() {
       setPdfError(null);
     }
     setPdfFiles(prev => [...prev, ...validPdfs]);
+  };
+
+  const handlePdfChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    processPdfFiles(Array.from(e.target.files || []));
     if (pdfInputRef.current) pdfInputRef.current.value = '';
+  };
+
+  const handlePdfDrop = (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    setIsDraggingPdf(false);
+    if (isMerging) return;
+    processPdfFiles(Array.from(e.dataTransfer.files));
   };
 
   const removePdf = (index: number) => {
@@ -254,6 +453,15 @@ export default function App() {
             오디오 전사
           </button>
           <button
+            onClick={() => setActiveTab('compress')}
+            className={`px-4 py-2 rounded-lg text-sm font-medium transition-all flex items-center gap-2 ${
+              activeTab === 'compress' ? 'bg-white text-emerald-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'
+            }`}
+          >
+            <Settings size={16} />
+            오디오 압축
+          </button>
+          <button
             onClick={() => setActiveTab('pdf')}
             className={`px-4 py-2 rounded-lg text-sm font-medium transition-all flex items-center gap-2 ${
               activeTab === 'pdf' ? 'bg-white text-emerald-600 shadow-sm' : 'text-gray-500 hover:text-gray-700'
@@ -322,43 +530,89 @@ export default function App() {
 
                 <div 
                   className={`border-2 border-dashed rounded-xl p-12 flex flex-col items-center justify-center transition-colors cursor-pointer ${
-                    file ? 'border-emerald-200 bg-emerald-50/30' : 'border-gray-200 hover:border-emerald-300 hover:bg-gray-50'
+                    isDraggingAudio ? 'border-emerald-500 bg-emerald-50' : files.length > 0 ? 'border-emerald-200 bg-emerald-50/30' : 'border-gray-200 hover:border-emerald-300 hover:bg-gray-50'
                   }`}
                   onClick={() => !isTranscribing && fileInputRef.current?.click()}
+                  onDragOver={(e) => { e.preventDefault(); setIsDraggingAudio(true); }}
+                  onDragEnter={(e) => { e.preventDefault(); setIsDraggingAudio(true); }}
+                  onDragLeave={(e) => { e.preventDefault(); setIsDraggingAudio(false); }}
+                  onDrop={handleAudioDrop}
                 >
                   <input 
                     type="file" 
                     ref={fileInputRef}
                     onChange={handleFileChange}
-                    accept=".m4a"
+                    accept="audio/*"
+                    multiple
                     className="hidden"
                   />
-                  {file ? (
-                    <div className="text-center">
-                      <FileAudio className="mx-auto text-emerald-500 mb-4" size={48} />
-                      <p className="font-medium mb-1">{file.name}</p>
-                      <p className="text-xs text-gray-400">{(file.size / (1024 * 1024)).toFixed(2)} MB</p>
-                    </div>
-                  ) : (
-                    <div className="text-center">
-                      <Upload className="mx-auto text-gray-300 mb-4" size={48} />
-                      <p className="font-medium mb-1">m4a 파일을 드래그하거나 클릭하여 업로드하세요</p>
-                      <p className="text-xs text-gray-400">과학 강연, 실험 녹음 등</p>
-                    </div>
-                  )}
+                  <div className="text-center">
+                    <Upload className="mx-auto text-gray-300 mb-4" size={48} />
+                    <p className="font-medium mb-1">오디오 파일을 드래그하거나 클릭하여 업로드하세요</p>
+                    <p className="text-xs text-gray-400">여러 파일을 한 번에 선택할 수 있습니다 (자동으로 순차 변환 및 다운로드)</p>
+                  </div>
                 </div>
+
+                {files.length > 0 && (
+                  <div className="mt-8 space-y-3">
+                    <div className="flex items-center justify-between">
+                      <h3 className="text-sm font-semibold text-gray-500 uppercase tracking-wider">업로드된 파일 ({files.length})</h3>
+                    </div>
+                    <div className="space-y-2">
+                      {files.map((f, i) => (
+                        <motion.div 
+                          layout
+                          key={`${f.name}-${i}`}
+                          className={`flex items-center justify-between p-4 rounded-xl border ${
+                            processingIndex === i 
+                              ? 'bg-emerald-50 border-emerald-200 ring-1 ring-emerald-500' 
+                              : 'bg-gray-50 border-black/5'
+                          }`}
+                        >
+                          <div className="flex items-center gap-3 overflow-hidden">
+                            {processingIndex === i ? (
+                              <Loader2 className="text-emerald-500 shrink-0 animate-spin" size={20} />
+                            ) : (
+                              <FileAudio className="text-emerald-500 shrink-0" size={20} />
+                            )}
+                            <div className="flex flex-col">
+                              <span className="text-sm font-medium truncate">{f.name}</span>
+                              {processingIndex === i && isCompressing && (
+                                <span className="text-xs text-emerald-600">압축 중... {compressionProgress}%</span>
+                              )}
+                              {processingIndex === i && !isCompressing && (
+                                <span className="text-xs text-emerald-600">AI 전사 중...</span>
+                              )}
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-3">
+                            <span className="text-xs text-gray-400 shrink-0">{(f.size / (1024 * 1024)).toFixed(2)} MB</span>
+                            <button 
+                              onClick={(e) => { e.stopPropagation(); removeFile(i); }} 
+                              disabled={isTranscribing}
+                              className="p-1.5 text-gray-400 hover:text-red-500 disabled:opacity-30"
+                            >
+                              <Trash2 size={16} />
+                            </button>
+                          </div>
+                        </motion.div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
                 {audioError && <p className="text-red-500 text-sm mt-4 text-center">{audioError}</p>}
                 <div className="mt-8 flex gap-3">
                   <button
                     onClick={transcribeAudio}
-                    disabled={!file || isTranscribing}
+                    disabled={files.length === 0 || isTranscribing}
                     className={`flex-1 py-4 rounded-xl font-medium flex items-center justify-center gap-2 transition-all ${
-                      !file || isTranscribing ? 'bg-gray-100 text-gray-400 cursor-not-allowed' : 'bg-emerald-500 text-white hover:bg-emerald-600 shadow-lg shadow-emerald-200'
+                      files.length === 0 || isTranscribing ? 'bg-gray-100 text-gray-400 cursor-not-allowed' : 'bg-emerald-500 text-white hover:bg-emerald-600 shadow-lg shadow-emerald-200'
                     }`}
                   >
                     {isTranscribing ? <><Loader2 className="animate-spin" size={20} />텍스트 추출 중...</> : <><RefreshCw size={20} />텍스트로 변환하기</>}
                   </button>
-                  {file && !isTranscribing && (
+                  {files.length > 0 && !isTranscribing && (
                     <button onClick={resetAudio} className="px-6 py-4 rounded-xl border border-gray-200 text-gray-500 hover:bg-gray-50 transition-colors">초기화</button>
                   )}
                 </div>
@@ -414,6 +668,116 @@ export default function App() {
                 )}
               </AnimatePresence>
             </motion.div>
+          ) : activeTab === 'compress' ? (
+            <motion.div
+              key="compress"
+              initial={{ opacity: 0, x: activeTab === 'audio' ? 20 : -20 }}
+              animate={{ opacity: 1, x: 0 }}
+              exit={{ opacity: 0, x: activeTab === 'audio' ? -20 : 20 }}
+              className="grid grid-cols-1 gap-8"
+            >
+              <section className="bg-white rounded-2xl shadow-sm border border-black/5 p-8">
+                <div 
+                  className={`border-2 border-dashed rounded-xl p-8 flex flex-col items-center justify-center transition-colors cursor-pointer ${
+                    isDraggingCompress ? 'border-emerald-500 bg-emerald-50' : 'border-gray-200 hover:border-emerald-300 hover:bg-gray-50'
+                  }`}
+                  onClick={() => !isCompressingTab && compressInputRef.current?.click()}
+                  onDragOver={(e) => { e.preventDefault(); setIsDraggingCompress(true); }}
+                  onDragEnter={(e) => { e.preventDefault(); setIsDraggingCompress(true); }}
+                  onDragLeave={(e) => { e.preventDefault(); setIsDraggingCompress(false); }}
+                  onDrop={handleCompressDrop}
+                >
+                  <input 
+                    type="file" 
+                    ref={compressInputRef}
+                    onChange={handleCompressFileChange}
+                    accept="audio/*,.mp3,.wav,.m4a,.ogg,.flac,.aac"
+                    multiple
+                    className="hidden"
+                  />
+                  <FileAudio className="text-gray-300 mb-4" size={48} />
+                  <p className="font-medium mb-1">압축할 오디오 파일 추가</p>
+                  <p className="text-xs text-gray-400">여러 파일을 한 번에 선택할 수 있습니다</p>
+                </div>
+
+                {compressError && <p className="text-red-500 text-sm mt-4 text-center whitespace-pre-wrap">{compressError}</p>}
+
+                {compressFiles.length > 0 && (
+                  <div className="mt-8 space-y-3">
+                    <h3 className="text-sm font-semibold text-gray-500 uppercase tracking-wider">파일 목록 ({compressFiles.length})</h3>
+                    <div className="space-y-2">
+                      {compressFiles.map((f, i) => {
+                        const isCurrentlyProcessing = compressProcessingIndex === i;
+                        const isCompleted = compressedResults.some(r => r.original === f);
+                        const result = compressedResults.find(r => r.original === f);
+                        
+                        return (
+                          <motion.div 
+                            layout
+                            key={`${f.name}-${i}`}
+                            className="flex items-center justify-between p-4 bg-gray-50 rounded-xl border border-black/5"
+                          >
+                            <div className="flex items-center gap-3 overflow-hidden">
+                              {isCurrentlyProcessing ? (
+                                <Loader2 className="text-emerald-500 animate-spin shrink-0" size={20} />
+                              ) : isCompleted ? (
+                                <CheckCircle2 className="text-emerald-500 shrink-0" size={20} />
+                              ) : (
+                                <FileAudio className="text-gray-400 shrink-0" size={20} />
+                              )}
+                              <span className="text-sm font-medium truncate">{f.name}</span>
+                              <span className="text-xs text-gray-400 shrink-0">{(f.size / (1024 * 1024)).toFixed(2)} MB</span>
+                            </div>
+                            
+                            <div className="flex items-center gap-3">
+                              {isCurrentlyProcessing && isCompressing && (
+                                <span className="text-xs text-emerald-600 font-medium whitespace-nowrap">
+                                  압축 중... {compressionProgress}%
+                                </span>
+                              )}
+                              {isCompleted && result && (
+                                <div className="flex items-center gap-2">
+                                  <span className="text-xs text-emerald-600 font-medium whitespace-nowrap">
+                                    {(result.compressed.size / (1024 * 1024)).toFixed(2)} MB
+                                  </span>
+                                  <button 
+                                    onClick={() => downloadCompressedFile(result.compressed)}
+                                    className="p-1.5 text-gray-400 hover:text-emerald-600"
+                                    title="다운로드"
+                                  >
+                                    <Download size={16} />
+                                  </button>
+                                </div>
+                              )}
+                              {!isCurrentlyProcessing && !isCompleted && (
+                                <button onClick={() => removeCompressFile(i)} className="p-1.5 text-gray-400 hover:text-red-500">
+                                  <Trash2 size={16} />
+                                </button>
+                              )}
+                            </div>
+                          </motion.div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                <div className="mt-8 flex gap-3">
+                  <button
+                    onClick={startCompressionOnly}
+                    disabled={compressFiles.length === 0 || isCompressingTab}
+                    className={`flex-1 py-4 rounded-xl font-medium flex items-center justify-center gap-2 transition-all ${
+                      compressFiles.length === 0 || isCompressingTab ? 'bg-gray-100 text-gray-400 cursor-not-allowed' : 'bg-emerald-500 text-white hover:bg-emerald-600 shadow-lg shadow-emerald-200'
+                    }`}
+                  >
+                    {isCompressingTab ? <><Loader2 className="animate-spin" size={20} />압축 진행 중...</> : <><Settings size={20} />오디오 압축 시작</>}
+                  </button>
+                  {compressFiles.length > 0 && !isCompressingTab && (
+                    <button onClick={resetCompress} className="px-6 py-4 rounded-xl border border-gray-200 text-gray-500 hover:bg-gray-50 transition-colors">초기화</button>
+                  )}
+                </div>
+              </section>
+            </motion.div>
           ) : (
             <motion.div
               key="pdf"
@@ -425,8 +789,14 @@ export default function App() {
               {/* PDF Merger UI */}
               <section className="bg-white rounded-2xl shadow-sm border border-black/5 p-8">
                 <div 
-                  className="border-2 border-dashed border-gray-200 rounded-xl p-8 flex flex-col items-center justify-center hover:border-emerald-300 hover:bg-gray-50 transition-colors cursor-pointer"
+                  className={`border-2 border-dashed rounded-xl p-8 flex flex-col items-center justify-center transition-colors cursor-pointer ${
+                    isDraggingPdf ? 'border-emerald-500 bg-emerald-50' : 'border-gray-200 hover:border-emerald-300 hover:bg-gray-50'
+                  }`}
                   onClick={() => !isMerging && pdfInputRef.current?.click()}
+                  onDragOver={(e) => { e.preventDefault(); setIsDraggingPdf(true); }}
+                  onDragEnter={(e) => { e.preventDefault(); setIsDraggingPdf(true); }}
+                  onDragLeave={(e) => { e.preventDefault(); setIsDraggingPdf(false); }}
+                  onDrop={handlePdfDrop}
                 >
                   <input 
                     type="file" 
