@@ -3,10 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useRef, useEffect } from 'react';
-import { GoogleGenAI } from "@google/genai";
-import { FFmpeg } from '@ffmpeg/ffmpeg';
-import { fetchFile, toBlobURL } from '@ffmpeg/util';
+import React, { useState, useRef } from 'react';
 import { 
   Upload, 
   FileAudio, 
@@ -36,9 +33,6 @@ import {
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { PDFDocument } from 'pdf-lib';
-
-// Initialize Gemini
-const genAI = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY || '' });
 
 type Tab = 'audio' | 'compress' | 'pdf';
 
@@ -71,42 +65,9 @@ export default function App() {
   const [targetLanguage, setTargetLanguage] = useState('ko');
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // FFmpeg State
-  const ffmpegRef = useRef(new FFmpeg());
-  const [isFfmpegLoaded, setIsFfmpegLoaded] = useState(false);
+  // Compression State
   const [isCompressing, setIsCompressing] = useState(false);
-  const [compressionProgress, setCompressionProgress] = useState(0);
   const [processingIndex, setProcessingIndex] = useState<number>(-1);
-
-  useEffect(() => {
-    loadFfmpeg();
-  }, []);
-
-  const loadFfmpeg = async (): Promise<boolean> => {
-    const ffmpeg = ffmpegRef.current;
-    if (ffmpeg.loaded) {
-      setIsFfmpegLoaded(true);
-      return true;
-    }
-    
-    const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd';
-    ffmpeg.on('progress', ({ progress }) => {
-      setCompressionProgress(Math.round(progress * 100));
-    });
-    
-    try {
-      await ffmpeg.load({
-        coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
-        wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
-      });
-      setIsFfmpegLoaded(true);
-      return true;
-    } catch (error) {
-      console.error('Error loading FFmpeg:', error);
-      setAudioError('오디오 처리 도구를 불러오는데 실패했습니다. 페이지를 새로고침 해주세요.');
-      return false;
-    }
-  };
 
   // PDF State
   const [pdfFiles, setPdfFiles] = useState<File[]>([]);
@@ -153,13 +114,6 @@ export default function App() {
     setIsCompressingTab(true);
     setCompressedResults([]);
     setCompressError(null);
-
-    const loaded = await loadFfmpeg();
-    if (!loaded) {
-      setCompressError('오디오 압축 도구를 불러오는데 실패했습니다. 네트워크 상태를 확인하거나 페이지를 새로고침 해주세요.');
-      setIsCompressingTab(false);
-      return;
-    }
 
     for (let i = 0; i < compressFiles.length; i++) {
       setCompressProcessingIndex(i);
@@ -225,26 +179,22 @@ export default function App() {
 
   const compressAudio = async (inputFile: File): Promise<File> => {
     setIsCompressing(true);
-    setCompressionProgress(0);
     try {
-      const ffmpeg = ffmpegRef.current;
-      const safeName = inputFile.name.replace(/[^a-zA-Z0-9.]/g, '_');
-      const inputName = `input_${Date.now()}_${safeName}`;
-      const outputName = `output_${Date.now()}.m4a`;
-      
-      await ffmpeg.writeFile(inputName, await fetchFile(inputFile));
-      
-      // Convert to m4a with lower bitrate (e.g., 64k) to compress
-      await ffmpeg.exec(['-i', inputName, '-b:a', '64k', outputName]);
-      
-      const fileData = await ffmpeg.readFile(outputName);
-      const data = new Uint8Array(fileData as ArrayBuffer);
-      const blob = new Blob([data.buffer], { type: 'audio/x-m4a' });
+      const formData = new FormData();
+      formData.append('audio', inputFile);
+
+      const response = await fetch('/api/compress', {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!response.ok) {
+        throw new Error('오디오 압축 중 오류가 발생했습니다.');
+      }
+
+      const blob = await response.blob();
       const newFile = new File([blob], inputFile.name.replace(/\.[^/.]+$/, "") + '_compressed.m4a', { type: 'audio/x-m4a' });
       
-      await ffmpeg.deleteFile(inputName);
-      await ffmpeg.deleteFile(outputName);
-
       return newFile;
     } catch (error) {
       console.error('Compression error:', error);
@@ -252,18 +202,6 @@ export default function App() {
     } finally {
       setIsCompressing(false);
     }
-  };
-
-  const fileToBase64 = (file: File): Promise<string> => {
-    return new Promise((resolve, reject) => {
-      const reader = new FileReader();
-      reader.readAsDataURL(file);
-      reader.onload = () => {
-        const base64String = (reader.result as string).split(',')[1];
-        resolve(base64String);
-      };
-      reader.onerror = (error) => reject(error);
-    });
   };
 
   const transcribeAudio = async () => {
@@ -282,34 +220,23 @@ export default function App() {
       const currentFile = files[i];
       
       try {
-        let targetFile = currentFile;
-        if (isFfmpegLoaded) {
-          targetFile = await compressAudio(currentFile);
+        const formData = new FormData();
+        formData.append('audio', currentFile);
+        formData.append('field', fieldInfo?.name || '일반');
+        formData.append('language', langInfo?.name || '한국어');
+
+        const response = await fetch('/api/transcribe', {
+          method: 'POST',
+          body: formData,
+        });
+
+        if (!response.ok) {
+          throw new Error('텍스트를 추출하지 못했습니다.');
         }
 
-        const base64Data = await fileToBase64(targetFile);
-        const model = "gemini-3-flash-preview";
-        const response = await genAI.models.generateContent({
-          model: model,
-          contents: [
-            {
-              role: "user",
-              parts: [
-                { inlineData: { mimeType: "audio/m4a", data: base64Data } },
-                { 
-                  text: `이 오디오 파일의 내용을 ${langInfo?.name}로 정확하게 받아쓰기(transcribe) 해주세요. 
-                  특히 ${fieldInfo?.name} 분야의 용어와 개념에 주의하여 정확하게 텍스트로 변환해주세요. 
-                  화자가 여러 명이라면 구분하여 작성해주고, 가독성 있게 문단을 나누어주세요.` 
-                }
-              ]
-            }
-          ],
-          config: {
-            systemInstruction: `당신은 전문 ${fieldInfo?.name} 분야의 속기사입니다. 제공된 오디오에서 해당 분야의 전문 용어를 정확하게 파악하고 ${langInfo?.name}로 완벽하게 전사합니다.`
-          }
-        });
-        
-        const text = response.text;
+        const data = await response.json();
+        const text = data.transcription;
+
         if (text) {
           const fileResult = `--- ${currentFile.name} ---\n${text}\n\n`;
           fullTranscription += fileResult;
@@ -577,11 +504,8 @@ export default function App() {
                             )}
                             <div className="flex flex-col">
                               <span className="text-sm font-medium truncate">{f.name}</span>
-                              {processingIndex === i && isCompressing && (
-                                <span className="text-xs text-emerald-600">압축 중... {compressionProgress}%</span>
-                              )}
-                              {processingIndex === i && !isCompressing && (
-                                <span className="text-xs text-emerald-600">AI 전사 중...</span>
+                              {processingIndex === i && (
+                                <span className="text-xs text-emerald-600">서버에서 처리 중... (압축 및 AI 전사)</span>
                               )}
                             </div>
                           </div>
@@ -730,9 +654,9 @@ export default function App() {
                             </div>
                             
                             <div className="flex items-center gap-3">
-                              {isCurrentlyProcessing && isCompressing && (
+                              {isCurrentlyProcessing && (
                                 <span className="text-xs text-emerald-600 font-medium whitespace-nowrap">
-                                  압축 중... {compressionProgress}%
+                                  서버에서 압축 중...
                                 </span>
                               )}
                               {isCompleted && result && (
