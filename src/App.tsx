@@ -4,6 +4,7 @@
  */
 
 import React, { useState, useRef } from 'react';
+import { GoogleGenAI } from '@google/genai';
 import { 
   Upload, 
   FileAudio, 
@@ -59,6 +60,7 @@ export default function App() {
   const [files, setFiles] = useState<File[]>([]);
   const [transcription, setTranscription] = useState<string>('');
   const [isTranscribing, setIsTranscribing] = useState(false);
+  const [jobStatus, setJobStatus] = useState<string>('');
   const [audioError, setAudioError] = useState<string | null>(null);
   const [copySuccess, setCopySuccess] = useState(false);
   const [selectedField, setSelectedField] = useState('science');
@@ -188,17 +190,25 @@ export default function App() {
         body: formData,
       });
 
+      const contentType = response.headers.get("content-type");
       if (!response.ok) {
-        throw new Error('오디오 압축 중 오류가 발생했습니다.');
+        let errorMessage = '오디오 압축 중 오류가 발생했습니다.';
+        if (contentType && contentType.includes("application/json")) {
+          try {
+            const errorData = await response.json();
+            errorMessage = errorData.error || errorMessage;
+          } catch (e) {}
+        }
+        throw new Error(errorMessage);
       }
 
       const blob = await response.blob();
-      const newFile = new File([blob], inputFile.name.replace(/\.[^/.]+$/, "") + '_compressed.m4a', { type: 'audio/x-m4a' });
+      const newFile = new File([blob], inputFile.name.replace(/\.[^/.]+$/, "") + '_compressed.mp3', { type: 'audio/mpeg' });
       
       return newFile;
-    } catch (error) {
+    } catch (error: any) {
       console.error('Compression error:', error);
-      throw new Error('오디오 압축 중 오류가 발생했습니다.');
+      throw new Error(error.message || '오디오 압축 중 오류가 발생했습니다.');
     } finally {
       setIsCompressing(false);
     }
@@ -214,9 +224,12 @@ export default function App() {
     const langInfo = LANGUAGES.find(l => l.id === targetLanguage);
 
     let fullTranscription = '';
+    
+    const apiKey = import.meta.env.VITE_GEMINI_API_KEY || '';
 
     for (let i = 0; i < files.length; i++) {
       setProcessingIndex(i);
+      setJobStatus('오디오 압축 중...');
       const currentFile = files[i];
       
       try {
@@ -224,26 +237,47 @@ export default function App() {
         formData.append('audio', currentFile);
         formData.append('field', fieldInfo?.name || '일반');
         formData.append('language', langInfo?.name || '한국어');
+        formData.append('apiKey', apiKey);
 
-        const response = await fetch('/api/transcribe', {
+        const startRes = await fetch('/api/transcribe/start', {
           method: 'POST',
           body: formData,
         });
 
-        if (!response.ok) {
-          throw new Error('텍스트를 추출하지 못했습니다.');
+        if (!startRes.ok) {
+          throw new Error('변환 작업 시작에 실패했습니다.');
         }
 
-        const data = await response.json();
-        const text = data.transcription;
+        const { jobId } = await startRes.json();
 
-        if (text) {
-          const fileResult = `--- ${currentFile.name} ---\n${text}\n\n`;
-          fullTranscription += fileResult;
-          setTranscription(fullTranscription);
-          downloadTxt(text, currentFile.name);
-        } else {
-          throw new Error('텍스트를 추출하지 못했습니다.');
+        let isCompleted = false;
+        while (!isCompleted) {
+          await new Promise(r => setTimeout(r, 3000));
+          const statusRes = await fetch(`/api/transcribe/status/${jobId}`);
+          
+          if (!statusRes.ok) {
+            throw new Error('상태 확인에 실패했습니다.');
+          }
+          
+          const job = await statusRes.json();
+
+          if (job.status === 'compressing') setJobStatus('오디오 압축 중...');
+          else if (job.status === 'uploading') setJobStatus('AI 서버로 업로드 중...');
+          else if (job.status === 'processing') setJobStatus('AI 서버에서 파일 처리 중...');
+          else if (job.status === 'transcribing') setJobStatus('텍스트 추출 중...');
+
+          if (job.status === 'failed') {
+            throw new Error(job.error || '변환 중 오류 발생');
+          } else if (job.status === 'completed') {
+            const text = job.transcription;
+            if (text) {
+              const fileResult = `--- ${currentFile.name} ---\n${text}\n\n`;
+              fullTranscription += fileResult;
+              setTranscription(fullTranscription);
+              downloadTxt(text, currentFile.name);
+            }
+            isCompleted = true;
+          }
         }
       } catch (err: any) {
         console.error(`Transcription error for ${currentFile.name}:`, err);
@@ -252,6 +286,7 @@ export default function App() {
     }
 
     setProcessingIndex(-1);
+    setJobStatus('');
     setIsTranscribing(false);
   };
 
@@ -473,7 +508,7 @@ export default function App() {
                     multiple
                     className="hidden"
                   />
-                  <div className="text-center">
+                  <div className="text-center pointer-events-none">
                     <Upload className="mx-auto text-gray-300 mb-4" size={48} />
                     <p className="font-medium mb-1">오디오 파일을 드래그하거나 클릭하여 업로드하세요</p>
                     <p className="text-xs text-gray-400">여러 파일을 한 번에 선택할 수 있습니다 (자동으로 순차 변환 및 다운로드)</p>
@@ -619,9 +654,11 @@ export default function App() {
                     multiple
                     className="hidden"
                   />
-                  <FileAudio className="text-gray-300 mb-4" size={48} />
-                  <p className="font-medium mb-1">압축할 오디오 파일 추가</p>
-                  <p className="text-xs text-gray-400">여러 파일을 한 번에 선택할 수 있습니다</p>
+                  <div className="text-center pointer-events-none">
+                    <FileAudio className="mx-auto text-gray-300 mb-4" size={48} />
+                    <p className="font-medium mb-1">압축할 오디오 파일 추가</p>
+                    <p className="text-xs text-gray-400">여러 파일을 한 번에 선택할 수 있습니다</p>
+                  </div>
                 </div>
 
                 {compressError && <p className="text-red-500 text-sm mt-4 text-center whitespace-pre-wrap">{compressError}</p>}
@@ -730,9 +767,11 @@ export default function App() {
                     multiple
                     className="hidden"
                   />
-                  <Plus className="text-gray-300 mb-4" size={48} />
-                  <p className="font-medium mb-1">PDF 파일들을 추가하세요</p>
-                  <p className="text-xs text-gray-400">여러 파일을 한 번에 선택할 수 있습니다</p>
+                  <div className="text-center pointer-events-none">
+                    <Plus className="mx-auto text-gray-300 mb-4" size={48} />
+                    <p className="font-medium mb-1">PDF 파일들을 추가하세요</p>
+                    <p className="text-xs text-gray-400">여러 파일을 한 번에 선택할 수 있습니다</p>
+                  </div>
                 </div>
 
                 {pdfError && <p className="text-red-500 text-sm mt-4 text-center">{pdfError}</p>}
